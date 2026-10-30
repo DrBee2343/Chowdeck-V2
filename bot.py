@@ -18,6 +18,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
+from curl_cffi import requests as cffi_requests
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -682,6 +683,13 @@ _CD_CLIENT = httpx.AsyncClient(
     ),
 )
 
+# NEW: Dedicated auth client to spoof Chrome and bypass Cloudflare WAF
+_AUTH_CLIENT = cffi_requests.AsyncSession(
+    impersonate="chrome120",
+    proxy=PROXY_URL,
+    timeout=AUTH_TIMEOUT
+)
+
 _TG_CLIENT = httpx.AsyncClient(
     timeout=httpx.Timeout(6.0, connect=4.0),
     proxy=PROXY_URL,
@@ -831,10 +839,9 @@ async def _auth_post(path, payload, token=None):
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
-        # Auth rides the shared connection pool but its per-request timeout is
-        # the auth one: a sign-in is allowed to be slower than a claim.
-        res = await _CD_CLIENT.post(
-            _auth_url(path), json=payload, headers=headers, timeout=AUTH_TIMEOUT
+        # Auth rides the spoofed Chrome client to bypass Cloudflare
+        res = await _AUTH_CLIENT.post(
+            _auth_url(path), json=payload, headers=headers
         )
         body = _safe_json(res)
     except Exception as e:  # noqa: BLE001
