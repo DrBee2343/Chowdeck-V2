@@ -43,43 +43,24 @@ HEDGE_REQUESTS = max(1, int(os.getenv("HEDGE_REQUESTS", "1")))
 REQUEST_CONCURRENCY = max(10, int(os.getenv("REQUEST_CONCURRENCY", "150")))
 
 # --- Outbound pacing -------------------------------------------------------
-# A 19-slot fanout used to fire ~340 requests inside ~4s (19 slots x 3 hedges x
-# 6 attempts), which made Chowdeck throttle *us*: self-inflicted 429/500 storms.
-# Pacing is *per chat*: each user gets their own token bucket, so one user's
-# claim burst (or 429 cooldown) can never stall another user. The fleet keeps
-# its concurrency but not its burst stampede.
 CLAIM_RATE = max(1.0, float(os.getenv("CLAIM_RATE", "14")))
 CLAIM_RATE_BURST = max(1, int(os.getenv("CLAIM_RATE_BURST", "24")))
-# Slot N waits N * SLOT_STAGGER_SECONDS before its first request, so slots do
-# not all land on the same millisecond. Kept tiny: every extra millisecond here
-# is a millisecond the last slot is not yet racing.
 SLOT_STAGGER_SECONDS = float(os.getenv("SLOT_STAGGER_SECONDS", "0.02"))
-# Telegram send pacing, also per chat (avoids flood-control 429s from per-slot
-# report bursts without one user's reports delaying another user's).
 TG_RATE = max(1.0, float(os.getenv("TG_RATE", "18")))
 TG_RATE_BURST = max(1, int(os.getenv("TG_RATE_BURST", "6")))
-# Optional cross-user ceiling (requests/second) for the shared Railway egress
-# IP. 0 = disabled: each chat is paced only by its own CLAIM_RATE bucket. Set
-# e.g. CLAIM_GLOBAL_RATE=40 to cap the *sum* of all users when the upstream
-# throttle is known to be IP-scoped.
 CLAIM_GLOBAL_RATE = max(0.0, float(os.getenv("CLAIM_GLOBAL_RATE", "0")))
 CLAIM_GLOBAL_RATE_BURST = max(1, int(os.getenv("CLAIM_GLOBAL_RATE_BURST", "24")))
-# Debug aid: dump the real Chowdeck response body (never masked) to stdout.
 LOG_RAW_CLAIM = os.getenv("LOG_RAW_CLAIM", "").strip().lower() in (
     "1", "true", "yes", "on",
 )
-# Legacy knob: retained for env compatibility. X detection is admin-only now,
-# so there is no multi-user fanout left to throttle.
 USER_CONCURRENCY = max(1, int(os.getenv("USER_CONCURRENCY", "12")))
 CLAIM_TIMEOUT = float(os.getenv("CLAIM_TIMEOUT", "4.0"))
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip() or _BASE_DIR
 
-
 def _data_file(name):
     return os.path.join(DATA_DIR, name)
-
 
 TOKENS_FILE = _data_file("tokens_multi.json")
 CARTS_FILE = _data_file("carts_multi.json")
@@ -96,26 +77,10 @@ WHITELIST_FILE = _data_file("whitelist.json")
 INVITE_CODES_FILE = _data_file("invite_codes.json")
 LOGIN_FLOW_FILE = _data_file("login_flows.json")
 
-# --- Feature 1: phone -> OTP login (a session token the BOT owns) ----------
-# The bot signs in with its own POST /auth/login + /auth/login/validate-otp
-# call, exactly like a second device signing in. The token it receives is a
-# normal bearer JWT that is independent of whatever token the user's browser
-# already holds, so linking/refreshing the bot's token never disturbs a web
-# session, and a web login never invalidates the bot's token.
 CHOW_API_BASE = os.getenv("CHOW_API_BASE", "https://api.chowdeck.com").strip().rstrip("/")
 CHOW_AUTH_ROLE = os.getenv("CHOW_AUTH_ROLE", "customer").strip() or "customer"
 CHOW_COUNTRY_CODE = os.getenv("CHOW_COUNTRY_CODE", "NG").strip().upper() or "NG"
 
-# --- international phone numbers -------------------------------------------
-# The API wants an ISO-3166 alpha-2 `country_code`, not a dial code. Verified
-# live against POST /auth/phone/validate:
-# {"phone":"9138972820","country_code":"NG"} -> is_valid true
-# {"phone":"2125551234","country_code":"US"} -> is_valid true
-# {"phone":"2125551234","country_code":"1"} -> is_valid false (dial code rejected)
-# {"phone":"4387985720","country_code":"US"} -> is_valid true (NANP, 10-digit national)
-# {"phone":"14387985720","country_code":"US"} -> is_valid true (11-digit with trunk 1)
-# So a "+"/"00" prefix (or an explicit US/CA/NG hint) is resolved to its ISO
-# code here, which is what makes US/CA accounts linkable like Nigerian ones.
 _DIAL_TO_ISO = {
     "1": "US", "7": "RU", "20": "EG", "27": "ZA", "30": "GR", "31": "NL",
     "32": "BE", "33": "FR", "34": "ES", "39": "IT", "40": "RO", "41": "CH",
@@ -137,28 +102,19 @@ _DIAL_TO_ISO = {
     "962": "JO", "964": "IQ", "965": "KW", "966": "SA", "971": "AE",
     "972": "IL", "973": "BH", "974": "QA", "977": "NP",
 }
-# Dial code -> ISO, longest prefix first ("1" vs "12", "234" vs "23").
 _DIAL_PREFIXES = sorted(_DIAL_TO_ISO, key=len, reverse=True)
-# Countries whose national format drops a single leading trunk "0".
 _TRUNK_ZERO_CC = {
     "NG", "GH", "KE", "GB", "IE", "ZA", "AU", "IN", "DE", "NL", "BE",
     "IT", "ES", "FR", "ID", "MY", "PK", "BD", "EG", "MA", "TR", "RU",
     "UA", "RO", "CH", "AT", "DK", "SE", "NO", "PL", "PT", "FI", "CZ",
     "SK", "HR", "RS", "BG", "LT", "LV", "EE", "VN", "TH", "GR", "IL",
 }
-# NANP: the same +1 country code is shared by the US and Canada, and the API
-# validator accepts either (verified: 4387985720 is valid as both US and CA),
-# so the alternate is tried when the first verdict is invalid.
 _NANP_CC = ("US", "CA")
-# ISO -> dial code, for stripping a redundant dial prefix off a national number.
 _DIAL_BY_ISO = {}
 for _dial, _iso in _DIAL_TO_ISO.items():
     _DIAL_BY_ISO.setdefault(_iso, _dial)
 _DIAL_BY_ISO["CA"] = "1"
 
-# Health probe: paths tried in order until one answers definitively. The first
-# is the storefront's own endpoint; the rest are harmless fallbacks so a
-# rename on Chowdeck's side degrades to a clear message instead of a mystery.
 HEALTH_PROBE_PATHS = [
     p.strip() for p in os.getenv(
         "HEALTH_PROBE_PATH", "/customer/profile,/customer,/customer/me,/profile"
@@ -171,39 +127,21 @@ LOGIN_ENABLED = os.getenv("LOGIN_ENABLED", "true").strip().lower() in (
 )
 OTP_FLOW_TTL = max(30.0, float(os.getenv("OTP_FLOW_TTL", "600")))
 OTP_RESEND_COOLDOWN = max(5.0, float(os.getenv("OTP_RESEND_COOLDOWN", "30")))
-# off = never auto-refresh (identical to the old behaviour)
-# safe = refresh only tokens this bot minted itself via /login (default)
-# on = also refresh tokens the user pasted from their own browser session
 CHOW_AUTO_REFRESH = os.getenv("CHOW_AUTO_REFRESH", "safe").strip().lower() or "safe"
 TOKEN_REFRESH_SKEW = float(os.getenv("TOKEN_REFRESH_SKEW", "120"))
 AUTH_TIMEOUT = float(os.getenv("AUTH_TIMEOUT", "6.0"))
-# Debug aid: dump the raw auth API response body to stdout (never masked).
 LOG_RAW_AUTH = os.getenv("LOG_RAW_AUTH", "").strip().lower() in (
     "1", "true", "yes", "on",
 )
 
-# --- Feature 2: AI security-answer assist (real-time web search) -----------
-# auto = enabled when any provider key is present, disabled otherwise.
 AI_ASSIST_ENABLED = os.getenv("AI_ASSIST_ENABLED", "auto").strip().lower()
 AI_PROVIDER = os.getenv("AI_PROVIDER", "").strip().lower()
 AI_MODEL = os.getenv("AI_MODEL", "").strip()
 AI_TIMEOUT = float(os.getenv("AI_TIMEOUT", "8.0"))
 AI_MAX_ANSWERS = max(1, min(8, int(os.getenv("AI_MAX_ANSWERS", "4"))))
-# Race every configured provider at once and post the first usable answer set:
-# this is what keeps the suggestion inside the 2-3s window instead of waiting
-# for one slow provider to time out before trying the next.
 AI_RACE = os.getenv("AI_RACE", "true").strip().lower() not in ("0", "false", "no", "off")
-# Two passes, because one budget cannot serve both goals:
-# pass 1 (AI_DEADLINE) - fast: keeps a suggestion inside the 2-3s claim
-# window, which is what AI_RACE is for
-# pass 2 (AI_LATE_DEADLINE) - second chance: a web-search grounded model
-# routinely needs longer than a few seconds, and a
-# late suggestion is still useful because the
-# question stays open until it is answered
 AI_DEADLINE = float(os.getenv("AI_DEADLINE", "3.0"))
 AI_LATE_DEADLINE = float(os.getenv("AI_LATE_DEADLINE", "12.0"))
-# When both passes come back empty, say so - with the provider's own reason -
-# instead of staying silent. Silence is what makes a working feature look broken.
 AI_NOTIFY_FAILURE = os.getenv("AI_NOTIFY_FAILURE", "true").strip().lower() not in (
     "0", "false", "no", "off",
 )
@@ -218,19 +156,14 @@ PERPLEXITY_MODEL = os.getenv("PERPLEXITY_MODEL", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 
-# Codes / words that must never be treated as promo codes.
 _IGNORE_TOKENS = {
     "CHOWDECK", "TODAY", "ORDER", "DELIVERY", "FREE", "LUNCH", "ALL",
     "ABUJA", "LAGOS", "GHANA", "ISMAIL", "MAY", "JUNE", "JULY",
     "TRUE", "FALSE", "PROMO", "CODE", "VOUCHER", "ANSWER", "HELP",
     "START", "STOP", "YES", "NO",
-    # Ordinary chatter that can show up in ALL CAPS. Only consulted for
-    # digit-free tokens, so real codes such as CHOW5K are never affected.
     "PLANS", "SLIGHT", "DROPS", "WILD", "SECONDS", "TOMORROW", "TONIGHT",
     "MAYBE", "LATER", "SOON", "SAME", "TIME", "NEXT", "CHANGE", "FIRST",
     "LATEST", "NEW", "POST", "VOUCHERS", "CODES", "PROMOS",
-    # Everyday greetings / courtesy words: harmless chatter that must never be
-    # mistaken for a code now that a lone mixed-case token is accepted.
     "HELLO", "HI", "HEY", "PLEASE", "THANKS", "THANK", "SORRY", "WELCOME",
     "OKAY", "NICE", "GREAT", "COOL", "MORNING", "EVENING", "NIGHT",
     "HAHA", "LOL", "CONGRATS", "CONGRATULATIONS",
@@ -245,7 +178,6 @@ _dirty = set()
 _dirty_event = threading.Event()
 _writer_started = False
 
-
 def _atomic_write(path, data):
     tmp = f"{path}.tmp"
     try:
@@ -253,7 +185,7 @@ def _atomic_write(path, data):
         with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
         os.replace(tmp, path)
-    except Exception as e:  # noqa: BLE001 - never let persistence kill the bot
+    except Exception as e:  # noqa: BLE001
         print(f"[store] failed to persist {path}: {e}", flush=True)
         try:
             if os.path.exists(tmp):
@@ -261,11 +193,10 @@ def _atomic_write(path, data):
         except Exception:
             pass
 
-
 def _writer_loop():
     while True:
         _dirty_event.wait()
-        time.sleep(0.25)  # debounce: coalesce rapid successive writes
+        time.sleep(0.25)
         with _store_lock:
             paths = list(_dirty)
             _dirty.clear()
@@ -275,7 +206,6 @@ def _writer_loop():
             if data is not None:
                 _atomic_write(path, data)
 
-
 def start_store_writer():
     global _writer_started
     with _store_lock:
@@ -284,9 +214,7 @@ def start_store_writer():
         _writer_started = True
     threading.Thread(target=_writer_loop, name="json-writer", daemon=True).start()
 
-
 def load_json(file_path):
-    """Return the cached document, hydrating from disk on first touch."""
     with _store_lock:
         if file_path in _cache:
             return _cache[file_path]
@@ -304,16 +232,13 @@ def load_json(file_path):
         _cache[file_path] = data
         return data
 
-
 def save_json(file_path, data):
     with _store_lock:
         _cache[file_path] = data
         _dirty.add(file_path)
     _dirty_event.set()
 
-
 def flush_store():
-    """Force pending cache writes to disk (used on shutdown)."""
     with _store_lock:
         paths = list(_dirty)
         _dirty.clear()
@@ -323,15 +248,12 @@ def flush_store():
         if data is not None:
             _atomic_write(path, data)
 
-
 # ---------------------------------------------------------------------------
 # Identity / access control
 # ---------------------------------------------------------------------------
 def is_admin_chat(chat_str):
-    """Only an explicitly configured ADMIN_CHAT_ID user is an admin. The previous logic (``not ADMIN_CHAT_ID or chat_str == ADMIN_CHAT_ID``) granted admin rights to every user whenever ADMIN_CHAT_ID was unset. """
     chat_str = str(chat_str)
     return bool(ADMIN_CHAT_ID) and chat_str == ADMIN_CHAT_ID
-
 
 def is_user_whitelisted(chat_str):
     chat_str = str(chat_str)
@@ -340,13 +262,11 @@ def is_user_whitelisted(chat_str):
     whitelist = load_json(WHITELIST_FILE)
     return bool(whitelist.get(chat_str, False))
 
-
 def add_to_whitelist(chat_str):
     chat_str = str(chat_str)
     whitelist = load_json(WHITELIST_FILE)
     whitelist[chat_str] = True
     save_json(WHITELIST_FILE, whitelist)
-
 
 def remove_from_whitelist(chat_str):
     chat_str = str(chat_str)
@@ -355,50 +275,37 @@ def remove_from_whitelist(chat_str):
         del whitelist[chat_str]
         save_json(WHITELIST_FILE, whitelist)
 
-
 def get_max_slots(chat_str):
     return ADMIN_MAX_SLOTS if is_admin_chat(chat_str) else USER_MAX_SLOTS
 
-
-# ---------------------------------------------------------------------------
-# Small state helpers
-# ---------------------------------------------------------------------------
 def get_bot_active():
     return bool(load_json(STATE_FILE).get("active", True))
-
 
 def set_bot_active(val):
     state = load_json(STATE_FILE)
     state["active"] = bool(val)
     save_json(STATE_FILE, state)
 
-
 def get_channel_announce():
-    """Whether detected codes are announced to the public Telegram channel."""
     return bool(load_json(STATE_FILE).get("channel_announce", True))
-
 
 def set_channel_announce(val):
     state = load_json(STATE_FILE)
     state["channel_announce"] = bool(val)
     save_json(STATE_FILE, state)
 
-
 def get_active_slot(chat_str):
     slots = load_json(ACTIVE_SLOT_FILE)
     return str(slots.get(str(chat_str), "1"))
-
 
 def set_active_slot(chat_str, slot):
     slots = load_json(ACTIVE_SLOT_FILE)
     slots[str(chat_str)] = str(slot)
     save_json(ACTIVE_SLOT_FILE, slots)
 
-
 def is_slot_active_state(chat_str, slot_id):
     toggles = load_json(ACCOUNT_TOGGLES_FILE).get(str(chat_str), {})
     return bool(toggles.get(str(slot_id), True))
-
 
 def toggle_slot_state(chat_str, slot_id):
     toggles = load_json(ACCOUNT_TOGGLES_FILE)
@@ -408,30 +315,24 @@ def toggle_slot_state(chat_str, slot_id):
     save_json(ACCOUNT_TOGGLES_FILE, toggles)
     return not current
 
-
 def get_burner_credentials(chat_str):
     return load_json(BURNER_FILE).get(str(chat_str), {})
-
 
 def save_burner_credentials(chat_str, token_data):
     burners = load_json(BURNER_FILE)
     burners[str(chat_str)] = token_data
     save_json(BURNER_FILE, burners)
 
-
 def get_burner_cart(chat_str):
     return load_json(BURNER_CART_FILE).get(str(chat_str), {})
-
 
 def save_burner_cart(chat_str, cart_data):
     carts = load_json(BURNER_CART_FILE)
     carts[str(chat_str)] = cart_data
     save_json(BURNER_CART_FILE, carts)
 
-
 def get_linked_accounts(chat_str):
     return list(load_json(LINKED_ACCOUNTS_FILE).get(str(chat_str), []))
-
 
 def add_linked_account(chat_str, secondary_chat_id):
     linked = load_json(LINKED_ACCOUNTS_FILE)
@@ -440,7 +341,6 @@ def add_linked_account(chat_str, secondary_chat_id):
     if sec_str and sec_str not in bucket:
         bucket.append(sec_str)
         save_json(LINKED_ACCOUNTS_FILE, linked)
-
 
 def remove_linked_account(chat_str, secondary_chat_id):
     linked = load_json(LINKED_ACCOUNTS_FILE)
@@ -451,7 +351,6 @@ def remove_linked_account(chat_str, secondary_chat_id):
             bucket.remove(sec_str)
             save_json(LINKED_ACCOUNTS_FILE, linked)
 
-
 def get_admin_stats():
     tokens_db = load_json(TOKENS_FILE)
     carts_db = load_json(CARTS_FILE)
@@ -459,7 +358,6 @@ def get_admin_stats():
     total_slots = sum(len(slots) for slots in tokens_db.values())
     total_carts = sum(len(carts) for carts in carts_db.values())
     return total_users, total_slots, total_carts
-
 
 def record_portfolio_win(chat_str, code, slot_id, amount=2000):
     chat_str = str(chat_str)
@@ -481,26 +379,15 @@ def record_portfolio_win(chat_str, code, slot_id, amount=2000):
         )
         save_json(PORTFOLIO_FILE, portfolio)
 
-
-# ---------------------------------------------------------------------------
-# Pending security-question prompt (only ONE live question per chat)
-# ---------------------------------------------------------------------------
 def add_or_update_pending(chat_str, entry):
-    """Register the security question that is currently shown to the user. Only one question is live per chat. Registering a question for a new code drops any older prompt for a *different* code, and re-registering the same code replaces its entry. This guarantees a pasted answer is always bound to the question the user is actually looking at; without it an answer could be applied to a previously-pending code instead of the one just claimed. """
     store = load_json(PENDING_PROMPT_FILE)
-    # Exactly one question is live per chat: registering a question (for any
-    # code) replaces whatever was pending, so a pasted answer is always bound
-    # to the question the user is actually looking at.
     store[str(chat_str)] = [entry]
     save_json(PENDING_PROMPT_FILE, store)
-
 
 def list_pending(chat_str):
     return list(load_json(PENDING_PROMPT_FILE).get(str(chat_str), []))
 
-
 def pop_pending(chat_str, code=None, reply_to=None):
-    """Remove and return the prompt a user is answering. Resolution order: explicit code -> Telegram reply target -> newest prompt. The fallback must be the NEWEST question: that is the one currently on screen, so a plain pasted answer is bound to the code the user just claimed. """
     store = load_json(PENDING_PROMPT_FILE)
     bucket = list(store.get(str(chat_str), []))
     target = None
@@ -516,7 +403,6 @@ def pop_pending(chat_str, code=None, reply_to=None):
         save_json(PENDING_PROMPT_FILE, store)
     return target
 
-
 def clear_pending(chat_str, code=None):
     store = load_json(PENDING_PROMPT_FILE)
     bucket = list(store.get(str(chat_str), []))
@@ -528,19 +414,13 @@ def clear_pending(chat_str, code=None):
     save_json(PENDING_PROMPT_FILE, store)
     return bucket
 
-
-# ---------------------------------------------------------------------------
-# Code / credential parsing helpers
-# ---------------------------------------------------------------------------
 def robust_clean_code(raw):
     if not raw:
         return ""
     normalized = unicodedata.normalize("NFKD", str(raw))
     return "".join(c for c in normalized if c.isalnum()).upper()
 
-
 def looks_like_code(raw):
-    """Return a normalized promo code, or None when the text is not code-like. Used for code-priority parsing so a fresh promo code pasted while a security prompt is open is treated as a code, not as the answer. """
     cleaned = robust_clean_code(raw)
     if not (4 <= len(cleaned) <= 24):
         return None
@@ -549,10 +429,8 @@ def looks_like_code(raw):
     if cleaned.startswith("INVITE"):
         return None
     if cleaned.isdigit():
-        # Bare numbers are far more likely to be an answer than a code.
         return None
     return cleaned
-
 
 def parse_jwt_payload(token):
     try:
@@ -564,7 +442,6 @@ def parse_jwt_payload(token):
     except Exception:
         pass
     return {}
-
 
 def extract_phone_from_data(data):
     if not isinstance(data, dict):
@@ -580,7 +457,6 @@ def extract_phone_from_data(data):
         or user.get("phone_number")
         or user.get("phone")
     )
-
 
 def parse_and_store_credentials(raw_input, chat_str, slot):
     cleaned = str(raw_input).strip()
@@ -632,7 +508,6 @@ def parse_and_store_credentials(raw_input, chat_str, slot):
     save_json(TOKENS_FILE, tokens_db)
     return extracted_token
 
-
 async def fetch_account_phone(token, cookies):
     if token and token.count(".") == 2:
         phone = extract_phone_from_data(parse_jwt_payload(token))
@@ -663,9 +538,8 @@ async def fetch_account_phone(token, cookies):
         print(f"[creds] profile fetch error: {e}", flush=True)
     return None
 
-
 # ---------------------------------------------------------------------------
-# Shared HTTP clients (connection reuse = lower latency)
+# Shared HTTP clients
 # ---------------------------------------------------------------------------
 _UA = (
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
@@ -683,10 +557,8 @@ _CD_CLIENT = httpx.AsyncClient(
     ),
 )
 
-# NEW: Dedicated auth client to spoof Chrome and bypass Cloudflare WAF
 _AUTH_CLIENT = cffi_requests.AsyncSession(
-    impersonate="chrome120",
-    proxy=PROXY_URL,
+    impersonate="chrome124",
     timeout=AUTH_TIMEOUT
 )
 
@@ -698,10 +570,7 @@ _TG_CLIENT = httpx.AsyncClient(
 
 _REQUEST_SEM = asyncio.Semaphore(REQUEST_CONCURRENCY)
 
-
 class _TokenBucket:
-    """Async token bucket that bounds outbound rate without serialising I/O. Callers ``await acquire()`` immediately before a request. The bucket refills at ``rate`` tokens/second up to ``burst`` tokens, so concurrency is preserved (many in-flight requests) while the *average* request rate stays under the ceiling that makes the upstream throttle us. """
-
     def __init__(self, rate, burst):
         self.rate = max(0.1, float(rate))
         self.capacity = max(1.0, float(burst))
@@ -724,7 +593,6 @@ class _TokenBucket:
             await asyncio.sleep(wait)
 
     async def backoff(self, seconds):
-        """Drain the bucket so the whole fleet honours a Retry-After window."""
         seconds = max(0.0, min(float(seconds or 0.0), 30.0))
         if seconds <= 0:
             return
@@ -732,13 +600,10 @@ class _TokenBucket:
             self._tokens = -seconds * self.rate
             self._updated = time.monotonic()
 
-
 _PACERS = {}
 _PACERS_LOCK = threading.Lock()
 
-
 def _pacer_for(scope, rate, burst):
-    """Return a token bucket unique to ``scope`` (created on first use). Keying the bucket by scope -- ``claim:<chat>`` for Chowdeck requests and ``tg:<chat>`` for Telegram sends -- is what keeps users isolated: a chat that fires 19 slot requests, or trips a 429 cooldown, drains only its own bucket and never delays anyone else's traffic. """
     key = (str(scope), float(rate), int(burst))
     with _PACERS_LOCK:
         bucket = _PACERS.get(key)
@@ -747,32 +612,23 @@ def _pacer_for(scope, rate, burst):
             _PACERS[key] = bucket
         return bucket
 
-
-# Per-task claim scope, set by the slot worker to its chat id so ``_raw_post``
-# (and the hedged helpers it spawns) know which bucket to draw from.
 _CLAIM_SCOPE = contextvars.ContextVar("claim_scope", default="")
 
-# Optional IP-level guard; disabled unless CLAIM_GLOBAL_RATE > 0.
 _GLOBAL_CLAIM_PACER = (
     _TokenBucket(CLAIM_GLOBAL_RATE, CLAIM_GLOBAL_RATE_BURST)
     if CLAIM_GLOBAL_RATE > 0
     else None
 )
 
-
 def _claim_pacer(scope):
     return _pacer_for("claim:" + str(scope or "_default"), CLAIM_RATE, CLAIM_RATE_BURST)
 
-
 async def _acquire_claim(scope):
-    """Take one claim token, applying the optional global (IP-level) guard."""
     if _GLOBAL_CLAIM_PACER is not None:
         await _GLOBAL_CLAIM_PACER.acquire()
     await _claim_pacer(scope).acquire()
 
-
 async def _claim_backoff(scope, wait):
-    """Drain this chat's bucket (and the global one) for a Retry-After window."""
     await _claim_pacer(scope).backoff(wait)
     if _GLOBAL_CLAIM_PACER is not None:
         await _GLOBAL_CLAIM_PACER.backoff(wait)
@@ -789,34 +645,16 @@ _CHOW_HEADERS_BASE = {
     "Sec-Fetch-Dest": "empty",
 }
 
-
 def chow_headers(token):
     headers = dict(_CHOW_HEADERS_BASE)
     headers["Authorization"] = f"Bearer {token}"
     return headers
 
-
-# ---------------------------------------------------------------------------
-# Feature 1 - Chowdeck auth client: phone -> OTP -> bot-owned session token
-# ---------------------------------------------------------------------------
-# Endpoints/payloads mirror the storefront bundle:
-# POST /auth/phone/validate {phone, country_code} -> data.is_valid
-# POST /auth/login {country_code, phone, role} -> sends the OTP
-# POST /auth/login/validate-otp {otp, phone, role} -> data.token (+ id, exp, ...)
-# POST /auth/resend-otp {phone, role, country_code, type} -> sends the OTP again
-# POST /auth/refresh-token {token} -> data.token
-# The validate-otp token is used exactly like a pasted token. It is minted by a
-# *separate* sign-in from the one the user's browser performed, so it is an
-# independent session: refreshing it never touches the web session, and a web
-# login never invalidates it.
 _bg_tasks = set()
 
-
 def spawn_bg(coro):
-    """Run a coroutine as fire-and-forget, keeping a strong task reference. Claim latency is sacred: every optional extra (token refresh, AI lookup) runs here, so it can never sit in front of a claim request. """
     task = asyncio.create_task(coro)
     _bg_tasks.add(task)
-
     def _done(t):
         _bg_tasks.discard(t)
         if t.cancelled():
@@ -824,35 +662,73 @@ def spawn_bg(coro):
         exc = t.exception()
         if exc is not None:
             print(f"[bg] background task failed: {exc}", flush=True)
-
     task.add_done_callback(_done)
     return task
-
 
 def _auth_url(path):
     return f"{CHOW_API_BASE}{path}"
 
+def _safe_json(res):
+    try:
+        return res.json()
+    except Exception:
+        return {}
+
+class _MockResponse:
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+    def json(self): return self._body
 
 async def _auth_post(path, payload, token=None):
-    """POST to the Chowdeck auth API. Returns (response|None, body dict)."""
+    """POST to the Chowdeck auth API. Routes through FlareSolverr if configured."""
     headers = dict(_CHOW_HEADERS_BASE)
     if token:
         headers["Authorization"] = f"Bearer {token}"
+        
+    target_url = _auth_url(path)
+    fs_url = os.getenv("FLARESOLVERR_URL", "").strip()
+
     try:
-        # Auth rides the spoofed Chrome client to bypass Cloudflare
-        res = await _AUTH_CLIENT.post(
-            _auth_url(path), json=payload, headers=headers
-        )
+        if fs_url:
+            fs_payload = {
+                "cmd": "request.post",
+                "url": target_url,
+                "postData": json.dumps(payload),
+                "headers": {"Content-Type": "application/json"},
+                "maxTimeout": 25000
+            }
+            res = await httpx.AsyncClient(timeout=30.0).post(
+                f"{fs_url}/v1", json=fs_payload
+            )
+            fs_data = res.json()
+            
+            if fs_data.get("status") == "ok":
+                html_response = fs_data.get("solution", {}).get("response", "")
+                status_code = fs_data.get("solution", {}).get("status", 200)
+                
+                match = re.search(r'>\s*(\{.*?\})\s*<', html_response, re.DOTALL)
+                json_str = match.group(1) if match else html_response.strip()
+                
+                try:
+                    body = json.loads(json_str)
+                except json.JSONDecodeError:
+                    body = {"message": "Failed to parse browser JSON"}
+                    
+                if LOG_RAW_AUTH:
+                    print(f"[fs-auth] {path} -> {status_code} {json_str[:400]}", flush=True)
+                return _MockResponse(status_code, body), body
+
+        res = await _AUTH_CLIENT.post(target_url, json=payload, headers=headers)
         body = _safe_json(res)
     except Exception as e:  # noqa: BLE001
         return None, {"message": str(e)}
+        
     if LOG_RAW_AUTH:
         print(f"[auth-raw] {path} -> {res.status_code} {json.dumps(body)[:400]}", flush=True)
     return res, body
 
-
 def _failure_reason(body):
-    """Best-effort reason string from either {message} or {data:{...}} shapes."""
     for src in (body or {}, (body or {}).get("data") or {}):
         if not isinstance(src, dict):
             continue
@@ -862,29 +738,21 @@ def _failure_reason(body):
                 return str(val)
     return ""
 
-
 def _iso_from_dial(digits):
-    """Split a dial code off `digits`. Returns (iso|None, national digits)."""
     for pref in _DIAL_PREFIXES:
         if digits.startswith(pref):
             rest = digits[len(pref):]
-            # A dial code only counts when a plausible national part remains.
             if 6 <= len(rest) <= 12:
                 return _DIAL_TO_ISO[pref], rest
     return None, digits
 
-
 def _normalise_phone(raw, country_code=None):
-    """Return (ISO country_code, national digits) for a user-typed phone number. Every shape a user may paste is accepted, so US/Canadian accounts link exactly like Nigerian ones: ``+12125551234`` / ``0012125551234`` / ``1 212 555 1234`` -> ("US", "2125551234") ``2125551234 US`` / ``US 2125551234`` -> ("US", "2125551234") ``12125551234`` (11-digit NANP, unambiguous) -> ("US", "2125551234") ``08031234567`` / ``2348031234567`` -> ("NG", "8031234567") The API wants an ISO alpha-2 code plus the *national* number, which is exactly what this returns. """
     text = str(raw or "").strip()
     digits = re.sub(r"\D", "", text)
-
     cc = (country_code or "").strip().upper() or None
     if cc and not re.fullmatch(r"[A-Z]{2}", cc):
         cc = None
 
-    # An explicit "+" or "00" prefix always wins: it is the least ambiguous
-    # thing the user can type.
     if text.startswith("+") or digits.startswith("00"):
         probe = digits[2:] if digits.startswith("00") else digits
         iso, rest = _iso_from_dial(probe)
@@ -895,8 +763,6 @@ def _normalise_phone(raw, country_code=None):
     if cc is None:
         cc = CHOW_COUNTRY_CODE
 
-    # A leading "1" on an 11-digit number can only be NANP: no national number
-    # of a non-NANP country looks like that, so this guess is safe.
     if country_code is None and len(digits) == 11 and digits.startswith("1"):
         cc, digits = "US", digits[1:]
 
@@ -911,17 +777,13 @@ def _normalise_phone(raw, country_code=None):
             digits = digits[1:]
     return cc, digits
 
-
 def _alt_national_form(cc, digits):
-    """The dial-prefixed form (``1`` + national) used as a login fallback."""
     dial = _DIAL_BY_ISO.get(str(cc or "").upper())
     if not dial or str(digits).startswith(dial):
         return None
     return f"{dial}{digits}"
 
-
 def _parse_login_arg(arg):
-    """Parse `/login` arguments into (ISO cc, national digits, error). Accepts the country code before or after the number, with or without a "+", e.g. ``/login us 2125551234``, ``/login 2125551234 us``. """
     parts = [p for p in re.split(r"[\s,]+", str(arg or "").strip()) if p]
     cc_hint, nums = None, []
     for token in parts:
@@ -934,24 +796,18 @@ def _parse_login_arg(arg):
     cc, national = _normalise_phone(" ".join(nums), cc_hint)
     return cc, national, ""
 
-
 _COUNTRY_LABELS = {
     "NG": "Nigeria", "US": "United States", "CA": "Canada", "GB": "United Kingdom",
     "GH": "Ghana", "KE": "Kenya", "ZA": "South Africa", "IN": "India",
 }
 
-
 def country_label(cc):
-    """Human label for an ISO alpha-2 code (falls back to the code itself)."""
     cc = str(cc or "").upper()
     return _COUNTRY_LABELS.get(cc, cc or "?")
 
-
 def phone_label(cc, digits):
-    """`+1 212****234`-style label: shows the country, never the whole number."""
     dial = _DIAL_BY_ISO.get(str(cc or "").upper(), "")
     return f"+{dial} {mask_phone_mid(digits)}" if dial else mask_phone_mid(digits)
-
 
 def mask_phone_mid(digits):
     d = re.sub(r"\D", "", str(digits or ""))
@@ -959,16 +815,12 @@ def mask_phone_mid(digits):
         return d
     return f"{d[:3]}****{d[-3:]}"
 
-
 def mask_phone(digits):
-    """Never echo a full phone number back into a chat."""
     d = str(digits or "")
     if len(d) <= 4:
         return d
     return f"{d[:3]}****{d[-3:]}"
 
-
-# --- login-flow store (one pending phone login per chat) -------------------
 def get_login_flow(chat_str):
     flow = load_json(LOGIN_FLOW_FILE).get(str(chat_str))
     if not isinstance(flow, dict):
@@ -978,12 +830,10 @@ def get_login_flow(chat_str):
         return None
     return flow
 
-
 def set_login_flow(chat_str, flow):
     store = load_json(LOGIN_FLOW_FILE)
     store[str(chat_str)] = flow
     save_json(LOGIN_FLOW_FILE, store)
-
 
 def clear_login_flow(chat_str):
     store = load_json(LOGIN_FLOW_FILE)
@@ -991,10 +841,7 @@ def clear_login_flow(chat_str):
         del store[str(chat_str)]
         save_json(LOGIN_FLOW_FILE, store)
 
-
-# --- token helpers ---------------------------------------------------------
 def token_exp_ts(token):
-    """`exp` claim of a JWT session token, as a unix timestamp (or None)."""
     try:
         payload = parse_jwt_payload(token) or {}
     except Exception:  # noqa: BLE001
@@ -1005,13 +852,11 @@ def token_exp_ts(token):
     except (TypeError, ValueError):
         return None
 
-
 def token_seconds_left(token):
     exp = token_exp_ts(token)
     if exp is None:
         return None
     return exp - time.time()
-
 
 def human_seconds(seconds):
     seconds = int(max(0, seconds))
@@ -1023,15 +868,12 @@ def human_seconds(seconds):
         return f"{seconds // 60}m"
     return f"{seconds}s"
 
-
 def set_slot_active_state(chat_str, slot_id, value):
-    """Force a slot's enabled/disabled flag (used to lock in a fresh login)."""
     toggles = load_json(ACCOUNT_TOGGLES_FILE)
     user_toggles = toggles.setdefault(str(chat_str), {})
     user_toggles[str(slot_id)] = bool(value)
     save_json(ACCOUNT_TOGGLES_FILE, toggles)
     return bool(value)
-
 
 def set_slot_phone(chat_str, slot_id, phone, country_code=None):
     tokens_db = load_json(TOKENS_FILE)
@@ -1042,9 +884,7 @@ def set_slot_phone(chat_str, slot_id, phone, country_code=None):
             entry["country_code"] = str(country_code).upper()[:2]
         save_json(TOKENS_FILE, tokens_db)
 
-
 def store_slot_token(chat_str, slot, token, *, phone=None, cookies=None, origin="login", country_code=None):
-    """Write a slot's session token (+ metadata) without touching other slots. `origin` records where the token came from: "login" for a token this bot minted with its own OTP sign-in, "paste" for a token the user copied out of their browser. `CHOW_AUTO_REFRESH=safe` (the default) only ever refreshes bot-owned tokens, so a live browser session can never be rotated away. """
     tokens_db = load_json(TOKENS_FILE)
     user_slots = tokens_db.setdefault(str(chat_str), {})
     entry = user_slots.get(str(slot))
@@ -1064,10 +904,7 @@ def store_slot_token(chat_str, slot, token, *, phone=None, cookies=None, origin=
     save_json(TOKENS_FILE, tokens_db)
     return entry
 
-
-# --- auth API calls --------------------------------------------------------
 async def chow_validate_phone(phone, country_code):
-    """Optional pre-check. Returns True/False, or None when unknown."""
     res, body = await _auth_post(
         "/auth/phone/validate", {"phone": phone, "country_code": country_code}
     )
@@ -1079,9 +916,7 @@ async def chow_validate_phone(phone, country_code):
         val = data["data"].get("is_valid")
     return bool(val) if val is not None else None
 
-
 async def chow_request_otp(phone, country_code):
-    """Ask Chowdeck to send a sign-in OTP. Returns (ok, message, reason)."""
     res, body = await _auth_post(
         "/auth/login",
         {"country_code": country_code, "phone": phone, "role": CHOW_AUTH_ROLE},
@@ -1094,9 +929,7 @@ async def chow_request_otp(phone, country_code):
         return True, msg or "Verification code sent.", ""
     return False, msg or f"Request rejected (HTTP {res.status_code}).", reason
 
-
 async def chow_validate_otp(phone, otp, country_code=None):
-    """Submit the OTP. Returns (ok, message, data). `country_code` is optional and only sent when known: the endpoint is keyed on the phone, but passing the ISO-2 code keeps US/Canada +1 numbers unambiguous, exactly like the request that produced the OTP. """
     payload = {"otp": str(otp).strip(), "phone": phone, "role": CHOW_AUTH_ROLE}
     if country_code:
         payload["country_code"] = str(country_code).upper()
@@ -1108,7 +941,6 @@ async def chow_validate_otp(phone, otp, country_code=None):
         return True, str((body or {}).get("message") or "Signed in."), data
     msg = str((body or {}).get("message") or "")
     return False, msg or f"Code rejected (HTTP {res.status_code}).", data
-
 
 async def chow_resend_otp(phone, country_code, otp_type="sign_in"):
     res, body = await _auth_post(
@@ -1127,9 +959,7 @@ async def chow_resend_otp(phone, country_code, otp_type="sign_in"):
     msg = str((body or {}).get("message") or "")
     return False, msg or f"Resend rejected (HTTP {res.status_code})."
 
-
 async def chow_refresh_token(token):
-    """Exchange a (possibly expired) session token for a fresh one."""
     if not token:
         return None
     res, body = await _auth_post("/auth/refresh-token", {"token": token})
@@ -1139,11 +969,8 @@ async def chow_refresh_token(token):
     new = data.get("token") or (body or {}).get("token")
     return str(new) if new else None
 
-
-# --- refresh policy + deduplicated background refresh ----------------------
 _refresh_tasks = {}
 _refresh_lock = threading.Lock()
-
 
 def _auto_refresh_mode():
     mode = (CHOW_AUTO_REFRESH or "safe").lower()
@@ -1153,9 +980,7 @@ def _auto_refresh_mode():
         return "on"
     return "safe"
 
-
 def _refresh_allowed(entry):
-    """Whether this slot's token may be auto-refreshed under the current mode."""
     mode = _auto_refresh_mode()
     if mode == "off":
         return False
@@ -1163,18 +988,15 @@ def _refresh_allowed(entry):
         return bool((entry or {}).get("token"))
     return str((entry or {}).get("origin") or "") == "login"
 
-
 def _token_needs_refresh(entry):
     if not _refresh_allowed(entry):
         return False
     left = token_seconds_left((entry or {}).get("token"))
     if left is None:
-        return False  # opaque token: nothing to reason about locally
+        return False
     return left <= TOKEN_REFRESH_SKEW
 
-
 async def refresh_slot_token(chat_str, slot, entry=None, force=False):
-    """Refresh one slot's token in place. Returns the new token, or None."""
     chat_str, slot = str(chat_str), str(slot)
     if entry is None:
         entry = ((load_json(TOKENS_FILE).get(chat_str) or {}).get(slot)) or {}
@@ -1191,7 +1013,6 @@ async def refresh_slot_token(chat_str, slot, entry=None, force=False):
     )
     return new_token
 
-
 async def _refresh_worker(chat_str, slot, entry):
     key = (str(chat_str), str(slot))
     try:
@@ -1204,9 +1025,7 @@ async def _refresh_worker(chat_str, slot, entry):
             if _refresh_tasks.get(key) is asyncio.current_task():
                 _refresh_tasks.pop(key, None)
 
-
 def start_token_refresh(chat_str, slot, entry):
-    """Kick off a de-duplicated background refresh for one slot's token."""
     key = (str(chat_str), str(slot))
     with _refresh_lock:
         task = _refresh_tasks.get(key)
@@ -1215,15 +1034,10 @@ def start_token_refresh(chat_str, slot, entry):
             _refresh_tasks[key] = task
     return task
 
-
-# --- health check ----------------------------------------------------------
 def _probe_definitive(status):
-    """A status that settles the auth question, so no other path need be tried."""
     return status is not None and (200 <= status < 300 or status in (401, 403))
 
-
 def _probe_note(status, body, path, err=""):
-    """Short human diagnosis of a probe result — always shows the real status."""
     msg = ""
     if isinstance(body, dict):
         for key in ("message", "error", "detail"):
@@ -1237,9 +1051,7 @@ def _probe_note(status, body, path, err=""):
     tail = f" — {msg}" if msg else ""
     return f"`{path}` → HTTP {status}{tail}"
 
-
 async def _probe_path(path, token, cookies=None):
-    """GET one candidate profile path. Never raises."""
     try:
         res = await _CD_CLIENT.get(
             f"{CHOW_API_BASE}{path}",
@@ -1251,9 +1063,7 @@ async def _probe_path(path, token, cookies=None):
         return {"path": path, "status": None, "body": {}, "err": str(e)}
     return {"path": path, "status": res.status_code, "body": _safe_json(res), "err": ""}
 
-
 async def chow_profile(token, cookies=None):
-    """Probe the account profile, trying ``HEALTH_PROBE_PATHS`` in order. Returns ``(status|None, phone, data, note)``. Requests are staggered and the first *decisive* answer (2xx / 401 / 403) wins, so a renamed or missing first path falls through quickly instead of yielding a mystery result. The returned ``note`` carries the path, the HTTP status and the API message, so the health view never reduces a failure to "unexpected response". """
     if not token:
         return None, None, {}, "no token stored"
     paths = list(HEALTH_PROBE_PATHS) or ["/customer/profile"]
@@ -1299,9 +1109,7 @@ async def chow_profile(token, cookies=None):
                        winner.get("err") or "")
     return winner.get("status"), phone, data, note
 
-
 async def probe_slot_token(chat_str, slot, allow_refresh=True):
-    """Live health of one slot: refresh if needed, then probe the profile."""
     chat_str, slot = str(chat_str), str(slot)
     entry = ((load_json(TOKENS_FILE).get(chat_str) or {}).get(slot)) or {}
     token = (entry or {}).get("token")
@@ -1336,9 +1144,7 @@ async def probe_slot_token(chat_str, slot, allow_refresh=True):
         "phone": phone or (entry or {}).get("phone"), "entry": entry,
     }
 
-
 async def check_all_slots(chat_str, concurrency=4):
-    """Probe every configured slot (bounded concurrency) for the health view."""
     chat_str = str(chat_str)
     max_slots = get_max_slots(chat_str)
     configured = load_json(TOKENS_FILE).get(chat_str, {}) or {}
@@ -1358,15 +1164,12 @@ async def check_all_slots(chat_str, concurrency=4):
 
     return list(await asyncio.gather(*(one(sid) for sid in slot_ids)))
 
-
 _STATE_ICON = {
     "active": "🟢", "expired": "🔴", "expiring": "🟡",
     "empty": "⚫", "unreachable": "🟠", "error": "🟠",
 }
 
-
 def format_accounts_health(results, chat_str=None):
-    """Render the multi-line accounts-health report (one line per slot)."""
     lines = ["🩺 *Account health check*", ""]
     active = 0
     for r in results:
@@ -1391,8 +1194,6 @@ def format_accounts_health(results, chat_str=None):
             if left is not None:
                 detail += f" · {human_seconds(left)} left"
         elif note and state != "empty":
-            # Show the path, HTTP status and API message: a failure must be
-            # diagnosable from the health view alone.
             detail += f" · {note}"
         if chat_str is not None and state != "empty" and not is_slot_active_state(chat_str, r.get("slot")):
             detail += " · ⏸️ disabled"
@@ -1401,10 +1202,7 @@ def format_accounts_health(results, chat_str=None):
     lines.append(f"🟢 active: `{active}` / `{len(results)}` slot(s)")
     return "\n".join(lines)
 
-
-# --- phone -> OTP login flow ----------------------------------------------
 def _phone_taken_by_other_slot(chat_str, phone, slot, country_code=None):
-    """Return the other slot id already linked to `phone`, else None. One account can only claim a code once, so the same phone must not be linked to two slots of the same user. The match is country-aware: identical national digits in two different countries are two different accounts, so a US number never blocks an identical-looking number elsewhere. """
     tokens_db = load_json(TOKENS_FILE).get(str(chat_str), {}) or {}
     target = re.sub(r"\D", "", str(phone or ""))
     target_cc = str(country_code or "").upper() or None
@@ -1415,15 +1213,12 @@ def _phone_taken_by_other_slot(chat_str, phone, slot, country_code=None):
         if not target or other != target:
             continue
         other_cc = str((td or {}).get("country_code") or "").upper() or None
-        # Only a known, different country clears the duplicate.
         if target_cc and other_cc and other_cc != target_cc:
             continue
         return str(sid)
     return None
 
-
 async def start_otp_login(chat_id, chat_str, arg):
-    """`/login <phone>` - request a Chowdeck OTP and arm the code capture."""
     chat_str = str(chat_str)
     if not LOGIN_ENABLED:
         await send_telegram(chat_id, "🔐 Phone login is disabled on this deployment. Use `/settoken`.")
@@ -1460,9 +1255,6 @@ async def start_otp_login(chat_id, chat_str, arg):
             f"re-linking it here.",
         )
         return
-    # The pre-check is only a courtesy: a false verdict must never block a
-    # login. The US and Canada share +1, so the sibling code is tried before a
-    # number is declared unknown.
     cc_try = [country_code]
     if country_code in _NANP_CC:
         cc_try += [c for c in _NANP_CC if c != country_code]
@@ -1519,9 +1311,7 @@ async def start_otp_login(chat_id, chat_str, arg):
         f"_While this login is open, a bare 4- or 6-digit message is treated as the code._",
     )
 
-
 async def complete_otp_login(chat_id, chat_str, code, flow):
-    """Submit the OTP, link the resulting token, and enable (lock in) the slot."""
     chat_str = str(chat_str)
     flow = dict(flow or {})
     phone = flow.get("phone")
@@ -1580,7 +1370,6 @@ async def complete_otp_login(chat_id, chat_str, code, flow):
     )
     return True
 
-
 async def resend_login_otp(chat_id, chat_str):
     flow = get_login_flow(chat_str)
     if not flow:
@@ -1606,14 +1395,10 @@ async def resend_login_otp(chat_id, chat_str):
         f"✅ New code sent to `{mask_phone(flow.get('phone'))}`. Send the code here.",
     )
 
-
 def looks_like_otp(text):
-    """A bare 4- or 6-digit message: the shapes a Chowdeck OTP can take."""
     return bool(re.fullmatch(r"\d{4}|\d{6}", str(text or "").strip()))
 
-
 async def maybe_handle_login_otp(chat_id, chat_str, text, reply_to, pending):
-    """Feature 1: a bare code completes an open OTP login. Only fires while THIS chat has a login awaiting a code, and never for a message that is a direct reply to a security-question prompt (that is an answer, not an OTP). Returns True when the message was consumed. """
     if not LOGIN_ENABLED:
         return False
     flow = get_login_flow(chat_str)
@@ -1630,37 +1415,22 @@ async def maybe_handle_login_otp(chat_id, chat_str, text, reply_to, pending):
     await complete_otp_login(chat_id, chat_str, str(text).strip(), flow)
     return True
 
-
 # ---------------------------------------------------------------------------
 # Feature 2 - AI security-answer assist (real-time web search)
 # ---------------------------------------------------------------------------
-# The claim path is untouched. When a slot reports a security question the
-# existing prompt is sent immediately and this lookup is spawned in the
-# BACKGROUND: its answer is only ever a suggestion, so a slow or failing AI can
-# never delay a claim, and the user still decides what gets submitted.
-# Built-in model defaults, used only when the matching *_MODEL var is unset.
-# `gemini` is a starting point, not the last word: _gemini_discover() replaces it
-# with whatever Flash model the key can actually use today.
 _AI_MODELS = {
     "perplexity": "sonar",
     "openai": "gpt-4o-mini",
     "gemini": "gemini-3.8-flash",
 }
 
-# Safety net for Gemini, best-first, used when live discovery is unavailable.
-# Google retires Flash models on a schedule - `gemini-2.0-flash` was shut down
-# on 2026-06-01 - so a hardcoded name is a time bomb. A retired model still
-# answers in milliseconds; it just answers 400 with no text, which is
-# indistinguishable from "the AI is silent". Discovery first, then this list.
 _GEMINI_MODEL_CANDIDATES = (
     "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
     "gemini-flash-latest",
 )
 
-# Resolved at runtime: {"model": best found, "available": [...], "ts": when}.
 _GEMINI_STATE = {"model": "", "available": [], "ts": 0.0}
-# Budget for the one-off model-list call, so discovery can never eat a lookup.
 _AI_MODEL_DISCOVER_TIMEOUT = float(os.getenv("AI_MODEL_DISCOVER_TIMEOUT", "2.0"))
 
 _AI_CLIENT = httpx.AsyncClient(
@@ -1668,24 +1438,16 @@ _AI_CLIENT = httpx.AsyncClient(
     proxy=PROXY_URL,
     limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
 )
-# The late pass gets its own client on purpose: a search-grounded answer often
-# needs longer than AI_TIMEOUT, and reusing the fast client would raise
-# ReadTimeout long before AI_LATE_DEADLINE was ever reached.
 _AI_CLIENT_LATE = httpx.AsyncClient(
     timeout=httpx.Timeout(max(AI_LATE_DEADLINE, AI_TIMEOUT) + 2.0, connect=4.0),
     proxy=PROXY_URL,
     limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
 )
 
-# Which client the current lookup should use. Set per lookup in
-# ai_answer_candidates() and inherited by its provider tasks, so the provider
-# functions keep the plain (question) signature the rest of the code expects.
 _AI_CLIENT_CTX = contextvars.ContextVar("ai_client", default=None)
-
 
 def _ai_client():
     return _AI_CLIENT_CTX.get() or _AI_CLIENT
-
 
 _AI_MODEL_VARS = {
     "perplexity": lambda: PERPLEXITY_MODEL,
@@ -1693,9 +1455,7 @@ _AI_MODEL_VARS = {
     "gemini": lambda: GEMINI_MODEL,
 }
 
-
 def _ai_model_for(provider):
-    """Model to call for `provider`. Per-provider vars win. `AI_MODEL` stays supported as a global override, but it is only applied to the provider it can plausibly belong to (the one pinned with AI_PROVIDER, or the only one configured): sending Gemini's model name to Perplexity is a guaranteed 400, which is exactly the kind of silent failure this feature must not have. """
     override = (_AI_MODEL_VARS.get(provider) or (lambda: ""))()
     if override:
         return override
@@ -1706,7 +1466,6 @@ def _ai_model_for(provider):
         ):
             return AI_MODEL
     if provider == "gemini" and _GEMINI_STATE.get("model"):
-        # Whatever discovery last confirmed this key can call.
         return str(_GEMINI_STATE["model"])
     return _AI_MODELS.get(provider, "")
 
@@ -1723,18 +1482,14 @@ _AI_PROMPT = (
     "Question: {question}"
 )
 
-
 def _ai_enabled():
-    """`AI_ASSIST_ENABLED=auto` means: on as soon as any provider key exists."""
     if AI_ASSIST_ENABLED in ("0", "false", "no", "off", "never"):
         return False
     if AI_ASSIST_ENABLED in ("1", "true", "yes", "on", "always"):
         return True
     return bool(PERPLEXITY_API_KEY or OPENAI_API_KEY or GEMINI_API_KEY or TAVILY_API_KEY)
 
-
 def _ai_provider_order():
-    """Providers to try, best-first. `AI_PROVIDER` pins the preferred one."""
     available = []
     if PERPLEXITY_API_KEY:
         available.append("perplexity")
@@ -1749,9 +1504,7 @@ def _ai_provider_order():
         available.insert(0, AI_PROVIDER)
     return available
 
-
 def _parse_ai_answers(text, limit=None):
-    """Turn a model reply into a clean, de-duplicated list of candidate answers. Two stages: the strict line-per-answer parse first, and - only when that yields nothing - the prose salvage (``_ai_prose_candidates``). A grounded model that answers in a full sentence is a good answer, not an empty one. """
     limit = int(limit or AI_MAX_ANSWERS)
     text = str(text or "")
     out, seen = [], set()
@@ -1774,24 +1527,14 @@ def _parse_ai_answers(text, limit=None):
         out = _ai_prose_candidates(text, limit)
     return out
 
-
-# --- Last-outcome bookkeeping -------------------------------------------------
-# A failed provider used to be swallowed completely: the lookup returned an
-# empty list and the chat heard nothing, so a missing key, a renamed model or a
-# grounding tool the model does not support looked exactly like a feature that
-# was never wired up. Every failure is now recorded here (and printed), so `/ai`
-# can name the reason and the chat can say why no suggestion arrived.
 _AI_LAST = {"provider": "", "kind": "", "detail": "", "ok": False, "ts": 0.0}
 
-
 def _ai_body_snippet(res, limit=160):
-    """First `limit` characters of a response body, for the failure record."""
     try:
         body = re.sub(r"\s+", " ", str(res.text or "")).strip()
     except Exception:  # noqa: BLE001
         body = ""
     return body[:limit]
-
 
 def _ai_note_error(provider, kind, detail=""):
     _AI_LAST.update({
@@ -1803,16 +1546,13 @@ def _ai_note_error(provider, kind, detail=""):
         line += f" - {detail}"
     print(f"[ai] {line}", flush=True)
 
-
 def _ai_note_ok(provider):
     _AI_LAST.update({
         "provider": str(provider), "kind": "", "detail": "",
         "ok": True, "ts": time.time(),
     })
 
-
 def _ai_failure_note():
-    """One short, Markdown-safe sentence describing the last lookup outcome."""
     ts = float(_AI_LAST.get("ts") or 0.0)
     if not ts:
         return "no lookup recorded yet"
@@ -1830,9 +1570,7 @@ def _ai_failure_note():
         return f"{label}: {kind}{age}"
     return f"no usable answer{age}"
 
-
 def _pending_question_open(chat_str, code):
-    """True while the security question for `code` is still awaiting an answer. A second-pass suggestion is only worth posting while the question is still on screen: once the user has answered, the prompt has been consumed and a late result must be dropped instead of popping up a stale button. """
     try:
         return any(
             str((entry or {}).get("code") or "") == str(code)
@@ -1841,14 +1579,6 @@ def _pending_question_open(chat_str, code):
     except Exception:  # noqa: BLE001
         return True
 
-
-# --- Prose salvage ------------------------------------------------------------
-# The prompt asks for bare values, one per line, and most models comply. A
-# web-grounded model sometimes answers in a sentence anyway ("Based on the
-# search results, the answer is 3500 (source: chowdeck.com)."), and the strict
-# line parser dropped anything longer than 60 characters - which turned a
-# correct answer into no suggestion at all. These helpers recover the short
-# value out of that sentence, and are only used when the strict parse is empty.
 _AI_FILLER_RE = re.compile(
     r"^(?:the\s+answer\s+is\s*|the\s+answer\s*[:=-]\s*|answer\s*[:=-]\s*|"
     r"it\s+is\s+|it'?s\s+|i\s+(?:think|believe)\s+(?:the\s+answer\s+is\s+)?|"
@@ -1862,9 +1592,7 @@ _AI_CITE_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 def _ai_clean_value(raw):
-    """Strip filler, citations and trailing punctuation from one candidate value."""
     value = str(raw or "").strip()
     if not value:
         return ""
@@ -1878,9 +1606,7 @@ def _ai_clean_value(raw):
         return ""
     return value
 
-
 def _ai_prose_candidates(text, limit=None):
-    """Recover short answer values from a prose reply (fallback only)."""
     limit = int(limit or AI_MAX_ANSWERS)
     out, seen = [], set()
     for raw_line in str(text or "").splitlines():
@@ -1900,9 +1626,7 @@ def _ai_prose_candidates(text, limit=None):
                 return out
     return out
 
-
 async def _ai_perplexity(question):
-    """Perplexity `sonar` is web-grounded by design: no extra tool needed."""
     client = _ai_client()
     model = _ai_model_for("perplexity")
     try:
@@ -1933,7 +1657,6 @@ async def _ai_perplexity(question):
         return []
     return _parse_ai_answers((choices[0].get("message") or {}).get("content"))
 
-
 async def _ai_openai(question):
     model = _ai_model_for("openai")
     client = _ai_client()
@@ -1942,7 +1665,6 @@ async def _ai_openai(question):
         "Content-Type": "application/json",
     }
     prompt = _AI_PROMPT.format(n=AI_MAX_ANSWERS, question=question)
-    # Preferred: the Responses API with the built-in web-search tool (live web).
     try:
         res = await client.post(
             "https://api.openai.com/v1/responses",
@@ -1970,7 +1692,6 @@ async def _ai_openai(question):
             _ai_note_error("openai", f"HTTP {res.status_code}", _ai_body_snippet(res))
     except Exception as e:  # noqa: BLE001
         _ai_note_error("openai", type(e).__name__, str(e))
-    # Fallback: classic chat completions (model knowledge, still useful).
     try:
         res = await client.post(
             "https://api.openai.com/v1/chat/completions",
@@ -1991,19 +1712,13 @@ async def _ai_openai(question):
         _ai_note_error("openai", type(e).__name__, str(e))
     return []
 
-
-# Words that mean "this model name is dead", as opposed to "your key is bad" or
-# "you are rate-limited". Kept separate from grounding errors, which also read
-# as "not supported" but are about the tool, not the model.
 _AI_MODEL_GONE_WORDS = (
     "no longer available", "not found", "does not exist", "deprecated",
     "update your code", "has been shut down", "decommissioned", "not available",
 )
 _AI_GROUNDING_WORDS = ("google_search", "search tool", "grounding", "grounded")
 
-
 def _gemini_model_gone(text):
-    """True when the message says the model name itself is unusable."""
     lowered = str(text or "").lower()
     if not lowered:
         return False
@@ -2011,9 +1726,7 @@ def _gemini_model_gone(text):
         return False
     return any(w in lowered for w in _AI_MODEL_GONE_WORDS)
 
-
 def _gemini_error_model(detail):
-    """Pull the replacement model out of Gemini's own error message. A retired model does not fail silently: it answers 400 with "This model models/gemini-2.0-flash is no longer available. Please update your code to use models/gemini-3.8-flash". The message names the fix, so the lookup can follow it instead of reporting nothing. """
     text = str(detail or "")
     if not _gemini_model_gone(text):
         return ""
@@ -2022,9 +1735,7 @@ def _gemini_error_model(detail):
             return name
     return ""
 
-
 def _gemini_rank(name):
-    """Rank a model name for this task. Higher is better; <0 means unusable. The goal is a real-time web-search answer, so: newest generation wins, plain Flash beats Flash-Lite (better at factual questions) but stays close (still fast), and anything audio/image/video/embedding is excluded outright. """
     lowered = str(name or "").lower()
     if not lowered:
         return -1
@@ -2037,20 +1748,18 @@ def _gemini_rank(name):
     major, minor = (int(nums[0][0]), int(nums[0][1])) if nums else (0, 0)
     score = major * 100 + minor * 10
     if "flash-lite" in lowered:
-        score += 4          # fastest of the family
+        score += 4
     elif "flash" in lowered:
-        score += 6          # best speed/accuracy balance for a factual lookup
+        score += 6
     else:
-        score -= 25         # pro and friends: slower than this task wants
+        score -= 25
     if "preview" in lowered or "exp" in lowered:
-        score -= 10         # previews get retired without notice
+        score -= 10
     if "latest" in lowered:
-        score += 1          # rolling alias: works, but unpredictable behind it
+        score += 1
     return score
 
-
 async def _gemini_discover(client):
-    """Ask Gemini which models this key can use; cache the best Flash model. One call per process (re-checked every 30 minutes), so the bot learns about a model retirement instead of hammering a dead name forever. """
     now = time.time()
     if _GEMINI_STATE.get("available") and now - float(_GEMINI_STATE.get("ts") or 0) < 1800:
         return list(_GEMINI_STATE["available"])
@@ -2087,16 +1796,12 @@ async def _gemini_discover(client):
         print("[ai] gemini returned no usable generateContent model", flush=True)
     return names
 
-
 def _gemini_candidates():
-    """Best-first models to try for one lookup (pinned -> resolved -> known)."""
     out = []
-
     def add(name):
         name = str(name or "").strip()
         if name and name not in out:
             out.append(name)
-
     add(_ai_model_for("gemini"))
     add(_GEMINI_STATE.get("model"))
     for name in _GEMINI_STATE.get("available") or []:
@@ -2105,9 +1810,7 @@ def _gemini_candidates():
         add(name)
     return out[:4]
 
-
 async def _ai_warm_models():
-    """Resolve the Gemini model list at boot so the first live lookup is fast."""
     if not GEMINI_API_KEY:
         return
     try:
@@ -2115,9 +1818,7 @@ async def _ai_warm_models():
     except Exception as e:  # noqa: BLE001
         print(f"[ai] model warmup failed: {e}", flush=True)
 
-
 async def _ai_gemini(question):
-    """Gemini with the Google Search tool (live web), model knowledge as backup. The model name is resolved at runtime, never assumed. A retired model (the reason this feature appeared dead: `gemini-2.0-flash` was shut down on 2026-06-01 and answered 400 immediately) is detected and stepped over, using Google's own suggested replacement when the message names one. """
     client = _ai_client()
     prompt = _AI_PROMPT.format(n=AI_MAX_ANSWERS, question=question)
 
@@ -2127,7 +1828,7 @@ async def _ai_gemini(question):
                 _gemini_discover(client), timeout=_AI_MODEL_DISCOVER_TIMEOUT
             )
         except Exception:  # noqa: BLE001
-            pass  # discovery is an optimisation; the candidate list still stands
+            pass
 
     async def ask(model, with_search):
         body = {"contents": [{"parts": [{"text": prompt}]}]}
@@ -2177,7 +1878,6 @@ async def _ai_gemini(question):
             _remember(model)
             return answers
 
-        # Retired or renamed: Google's message names the replacement, so take it.
         replacement = _gemini_error_model(note)
         if replacement and replacement not in tried:
             tried.append(replacement)
@@ -2187,9 +1887,8 @@ async def _ai_gemini(question):
                 return replacement_answers
             continue
         if _gemini_model_gone(note):
-            continue  # dead name: the next candidate may still work
+            continue
 
-        # Grounding tool unsupported on this model: answer from model knowledge.
         lowered = str(note or "").lower()
         if lowered and any(w in lowered for w in ("ground", "tool", "not supported")):
             fallback = (await ask(model, False))[1]
@@ -2198,12 +1897,10 @@ async def _ai_gemini(question):
                 return fallback
             continue
 
-        break  # a real error (bad key, quota, billing): stop guessing
+        break
     return []
 
-
 async def _ai_tavily(question):
-    """Tavily is a search API: its `answer` field is the grounded suggestion."""
     client = _ai_client()
     try:
         res = await client.post(
@@ -2233,7 +1930,6 @@ async def _ai_tavily(question):
             lines.append(title)
     return _parse_ai_answers("\n".join(lines))
 
-
 _AI_PROVIDER_FUNCS = {
     "perplexity": _ai_perplexity,
     "openai": _ai_openai,
@@ -2248,18 +1944,14 @@ _AI_PROVIDER_LABELS = {
     "tavily": "Tavily",
 }
 
-
 async def _ai_with_client(func, client, question):
-    """Run one provider function with `client` bound for the call. The provider functions keep their plain ``(question)`` signature; the client for the current pass is handed to them through a ContextVar so the fast and late passes can use different timeouts without touching every provider. """
     token = _AI_CLIENT_CTX.set(client)
     try:
         return await func(question)
     finally:
         _AI_CLIENT_CTX.reset(token)
 
-
 async def _ai_lookup_once(question, deadline, client):
-    """One full lookup: ``(provider, [answers], elapsed_seconds)``. Providers are raced in parallel (``AI_RACE``, the default) and the first usable answer set wins, so one slow provider can no longer hold the whole lookup for its full timeout while the next one waits its turn. The lookup is bounded by ``deadline``, which is what keeps the fast pass inside the 2-3s window. """
     funcs = [(n, _AI_PROVIDER_FUNCS[n]) for n in _ai_provider_order()
              if _AI_PROVIDER_FUNCS.get(n)]
     if not funcs:
@@ -2312,16 +2004,10 @@ async def _ai_lookup_once(question, deadline, client):
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
     if winner[0] is not None:
-        # Record the win: without this the last-outcome note (shown by `/ai`)
-        # would keep quoting a losing provider's error even though a suggestion
-        # was posted - exactly the "is this even wired up?" confusion this
-        # feature has to avoid.
         _ai_note_ok(winner[0])
     return winner[0], winner[1], time.monotonic() - started
 
-
 async def ai_answer_candidates(question, late=False):
-    """Look one question up: ``(provider, [answers], elapsed_seconds)``. ``late=False`` is the fast pass (``AI_DEADLINE``, short-timeout client): it is what keeps a suggestion inside the 2-3s claim window. ``late=True`` is the second chance (``AI_LATE_DEADLINE``, long-timeout client): a web-search grounded model routinely needs longer than the fast budget, and a late answer still helps because the question stays open until it is answered. """
     question = str(question or "").strip()
     if not question or not _ai_enabled():
         return None, [], 0.0
@@ -2329,9 +2015,7 @@ async def ai_answer_candidates(question, late=False):
         return await _ai_lookup_once(question, AI_LATE_DEADLINE, _AI_CLIENT_LATE)
     return await _ai_lookup_once(question, AI_DEADLINE, _AI_CLIENT)
 
-
 def ai_status_text():
-    """Read-only summary of the AI assist setup (for `/ai` with no argument)."""
     order = [n for n in _ai_provider_order() if _AI_PROVIDER_FUNCS.get(n)]
     labels = ", ".join(_AI_PROVIDER_LABELS.get(n, n) for n in order) or "*(none configured)*"
     models = ", ".join(
@@ -2366,9 +2050,7 @@ def ai_status_text():
         "off and the bot behaves exactly as before._"
     )
 
-
 def set_pending_ai(chat_str, code, provider, answers):
-    """Attach AI suggestions to the live prompt for `code` (no-op if gone)."""
     store = load_json(PENDING_PROMPT_FILE)
     bucket = list(store.get(str(chat_str), []))
     changed = False
@@ -2384,9 +2066,7 @@ def set_pending_ai(chat_str, code, provider, answers):
         store[str(chat_str)] = bucket
         save_json(PENDING_PROMPT_FILE, store)
 
-
 def ai_answer_keyboard(code, answers, submitted=None):
-    """One tap = submit that suggestion. `submitted` marks the chosen one."""
     rows = []
     for idx, answer in enumerate(answers):
         prefix = "✅" if submitted is not None and idx == submitted else "💡"
@@ -2396,9 +2076,7 @@ def ai_answer_keyboard(code, answers, submitted=None):
         }])
     return {"inline_keyboard": rows} if rows else None
 
-
 async def _ai_post_suggestions(chat_id, chat_str, code, question, provider, answers, elapsed):
-    """Attach suggestions to the live prompt and post the tap-to-submit message."""
     set_pending_ai(chat_str, code, provider, answers)
     label = _AI_PROVIDER_LABELS.get(provider, provider)
     tail = f" · {elapsed:.1f}s" if AI_SHOW_LATENCY else ""
@@ -2419,9 +2097,7 @@ async def _ai_post_suggestions(chat_id, chat_str, code, question, provider, answ
         chat_id, "\n".join(lines), reply_markup=ai_answer_keyboard(code, answers)
     )
 
-
 async def assist_security_question(chat_id, chat_str, code, question):
-    """Background AI lookup for a live security question (never blocks a claim). Two passes, because one budget cannot serve both goals: * pass 1 (``AI_DEADLINE``) — fast enough to land beside the claim prompt; * pass 2 (``AI_LATE_DEADLINE``) — the second chance for a web-search grounded model, which routinely needs longer than a few seconds. The prompt stays open until it is answered, so a late suggestion is still useful; if the user has answered meanwhile the late result is dropped rather than posting a stale button. When both passes come back empty the chat is told why (unless ``AI_NOTIFY_FAILURE`` is off). Staying silent is what made a wired-up feature look like a broken one. """
     if not _ai_enabled():
         return
     question = str(question or "").strip()
@@ -2466,12 +2142,10 @@ async def assist_security_question(chat_id, chat_str, code, question):
             "_The question is still open — answer it as usual._",
         )
 
-
 # ---------------------------------------------------------------------------
 # Telegram helpers
 # ---------------------------------------------------------------------------
 async def send_telegram(chat_id, text, reply_markup=None, parse_mode="Markdown"):
-    """Send a message, paced through a shared token bucket. A multi-slot claim emits many reports in quick succession. Without pacing that burst trips Telegram flood control (HTTP 429) and messages are dropped silently. Here every send first takes a token, and a 429 is honoured using Telegram's ``retry_after`` before retrying, so no report is lost. Formatting errors still retry once with ``parse_mode`` removed. """
     if not chat_id or not TELEGRAM_BOT_TOKEN:
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -2510,22 +2184,17 @@ async def send_telegram(chat_id, text, reply_markup=None, parse_mode="Markdown")
             return None
     return None
 
-
 async def broadcast_to_channel(text):
     if not TELEGRAM_CHANNEL_ID:
         return
     await send_telegram(TELEGRAM_CHANNEL_ID, text)
 
-
 async def announce_channel(text):
-    """Post to the public channel only when channel announcements are enabled. The admin can flip this off from the admin panel (btn_toggle_channel) so detected codes are served only to the admin without a public broadcast. """
     if not get_channel_announce():
         return
     await broadcast_to_channel(text)
 
-
 def get_admin_claim_targets():
-    """Admin chat plus the admin's linked secondary accounts. These are the ONLY accounts an X-detected code is auto-claimed for. Regular whitelisted users grab the code from the channel broadcast and claim it themselves (paste the code, or /code <CODE>). """
     targets = []
     if ADMIN_CHAT_ID:
         targets.append(ADMIN_CHAT_ID)
@@ -2534,7 +2203,6 @@ def get_admin_claim_targets():
             if linked not in targets:
                 targets.append(linked)
     return targets
-
 
 async def answer_callback_query(callback_query_id, text=""):
     if not TELEGRAM_BOT_TOKEN:
@@ -2546,7 +2214,6 @@ async def answer_callback_query(callback_query_id, text=""):
         )
     except Exception as e:  # noqa: BLE001
         print(f"[tg] callback answer error: {e}", flush=True)
-
 
 async def edit_message_text(chat_id, message_id, text, reply_markup=None, parse_mode="Markdown"):
     if not TELEGRAM_BOT_TOKEN:
@@ -2574,7 +2241,6 @@ async def edit_message_text(chat_id, message_id, text, reply_markup=None, parse_
                 continue
             print(f"[tg] edit error: {e}", flush=True)
 
-
 async def perform_ocr_on_image(image_bytes):
     try:
         files = {"file": ("screenshot.jpg", image_bytes, "image/jpeg")}
@@ -2591,9 +2257,8 @@ async def perform_ocr_on_image(image_bytes):
         print(f"[ocr] error: {e}", flush=True)
     return ""
 
-
 # ---------------------------------------------------------------------------
-# Keyboards (prompt mode only - no mode toggle)
+# Keyboards
 # ---------------------------------------------------------------------------
 def build_control_keyboard(chat_str, is_admin):
     active_slot = get_active_slot(chat_str)
@@ -2654,7 +2319,6 @@ def build_control_keyboard(chat_str, is_admin):
         ])
     return {"inline_keyboard": keyboard}
 
-
 def build_accounts_keyboard(chat_str):
     tokens_db = load_json(TOKENS_FILE).get(str(chat_str), {})
     max_slots = get_max_slots(chat_str)
@@ -2676,19 +2340,16 @@ def build_accounts_keyboard(chat_str):
     ])
     return {"inline_keyboard": rows}
 
-
 def build_admin_burner_keyboard():
     return {"inline_keyboard": [
         [{"text": "🧪 Test Code (send /test CODE)", "callback_data": "burner_info"}],
         [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}],
     ]}
 
-
 def build_admin_linked_keyboard():
     return {"inline_keyboard": [
         [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}],
     ]}
-
 
 def build_admin_invites_keyboard():
     return {"inline_keyboard": [
@@ -2697,19 +2358,10 @@ def build_admin_invites_keyboard():
         [{"text": "🔙 Back to Main Menu", "callback_data": "btn_main_menu"}],
     ]}
 
-
 # ---------------------------------------------------------------------------
-# Claim core - hedged single-slot claim (prompt mode only)
+# Claim core - hedged single-slot claim
 # ---------------------------------------------------------------------------
-def _safe_json(res):
-    try:
-        return res.json()
-    except Exception:
-        return {}
-
-
 def _retry_after_seconds(res, default=1.0):
-    """Parse a Retry-After header (delta-seconds or HTTP-date); else `default`."""
     if res is None:
         return default
     raw = res.headers.get("Retry-After") or res.headers.get("retry-after")
@@ -2731,10 +2383,7 @@ def _retry_after_seconds(res, default=1.0):
         pass
     return default
 
-
 async def _raw_post(client, url, payload, headers, cookies):
-    # Paced before it leaves the process, per chat: this request draws only on
-    # its own chat's bucket so another user's fanout cannot slow it down.
     await _acquire_claim(_CLAIM_SCOPE.get())
     async with _REQUEST_SEM:
         res = await client.post(url, json=payload, headers=headers, cookies=cookies or None)
@@ -2748,9 +2397,7 @@ async def _raw_post(client, url, payload, headers, cookies):
                 pass
         return res, _safe_json(res)
 
-
 async def _hedged_post(client, url, payload, headers, cookies, n):
-    """Fire N near-simultaneous identical requests; return the best response. Hedging is what lets a slot beat the "voucher is in high demand" throttle: the first successful claim wins and the duplicates are discarded. """
     n = max(1, int(n))
     if n == 1:
         return await _raw_post(client, url, payload, headers, cookies)
@@ -2779,7 +2426,6 @@ async def _hedged_post(client, url, payload, headers, cookies, n):
         return best
     return None, {"message": "network error"}
 
-
 async def _apply_cart(client, headers, cookies, cart_info, code):
     cart_id = (cart_info or {}).get("cart_id")
     if not cart_id:
@@ -2799,14 +2445,10 @@ async def _apply_cart(client, headers, cookies, cart_info, code):
     except Exception as e:  # noqa: BLE001
         return f"\nCart apply error: `{e}`"
 
-
 async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db, lockouts_db, specific_answer=None, deadline=None, start_delay=0.0):
-    """Claim `code` for one slot using burst/hedged requests. With no `specific_answer` the first request probes with an empty answer so the API reveals the security question (prompt mode). With a `specific_answer` the answer is submitted immediately. """
     chat_str = str(chat_id)
     slot_key = str(slot_id)
 
-    # Bind this task's claim requests to this chat's pacer for the whole fanout
-    # (slots and hedged sub-tasks inherit it when their tasks are created).
     _CLAIM_SCOPE.set(chat_str)
 
     if not is_slot_active_state(chat_str, slot_key):
@@ -2816,10 +2458,6 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
     if not token:
         return {"slot": slot_key, "status": 0, "response": {"message": "skipped (no token)"}}
 
-    # Feature 1: if this slot's token is at or near expiry, refresh it in the
-    # BACKGROUND. The claim below still fires immediately with the current
-    # token, so a refresh can never add latency to a claim - it only means the
-    # next claim runs on a fresh token.
     if _token_needs_refresh(token_data):
         start_token_refresh(chat_str, slot_key, token_data)
 
@@ -2840,7 +2478,6 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
         deadline = time.time() + CLAIM_WINDOW_SECONDS
 
     if start_delay and start_delay > 0:
-        # Stagger the fleet so N slots do not all hit Chowdeck on the same tick.
         await asyncio.sleep(start_delay)
 
     last_res, last_json = None, {}
@@ -2859,8 +2496,6 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
             if res.status_code in (200, 201):
                 break
             if res.status_code in (401, 403) and not refreshed and _refresh_allowed(token_data):
-                # Reactive refresh: the token was rejected as unauthenticated.
-                # Mint a replacement and retry this slot once, in place.
                 refreshed = True
                 new_token = await refresh_slot_token(chat_str, slot_key, token_data, force=True)
                 if new_token:
@@ -2874,12 +2509,8 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
             if res.status_code == 429:
                 rate_limited = True
                 wait = _retry_after_seconds(res)
-                # Only this chat honours the cooldown; other users keep their
-                # own pace (the optional global guard covers IP-wide limits).
                 await _claim_backoff(_CLAIM_SCOPE.get(), wait)
                 if wait >= 1.5:
-                    # Upstream asked for a real cooldown; retrying inside this
-                    # short claim window only deepens the throttle. Stop cleanly.
                     break
             congested = (
                 res.status_code in (429, 500, 502, 503, 504)
@@ -2899,7 +2530,6 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
     msg_text = str(last_json.get("message", "")).lower()
     data_obj = last_json.get("data", {}) if isinstance(last_json.get("data"), dict) else {}
 
-    # Prompt mode: surface the security question when no answer was supplied.
     if not specific_answer:
         question = data_obj.get("security_question") or data_obj.get("question")
         hard_fail = any(
@@ -2940,7 +2570,6 @@ async def claim_slot_worker(client, chat_id, slot_id, token_data, code, carts_db
         "rate_limited": rate_limited,
     }
 
-
 async def execute_burner_test(chat_id, code):
     chat_str = str(chat_id)
     token_data = get_burner_credentials(chat_str)
@@ -2967,7 +2596,6 @@ async def execute_burner_test(chat_id, code):
     except Exception as e:  # noqa: BLE001
         return f"❌ Burner test error: {e}"
 
-
 # ---------------------------------------------------------------------------
 # Code extraction / dedupe
 # ---------------------------------------------------------------------------
@@ -2977,9 +2605,7 @@ loop_ref = None
 _recent_lock = threading.Lock()
 _recent_codes = {}
 
-
 def reserve_code(code, ttl=180):
-    """Return False when this code was already processed very recently."""
     now = time.time()
     with _recent_lock:
         for k in [k for k, v in _recent_codes.items() if now - v > ttl]:
@@ -2989,15 +2615,10 @@ def reserve_code(code, ttl=180):
         _recent_codes[code] = now
     return True
 
-
-# Money amounts (N2000, #5000, 20K) and clock times (5:50pm -> 50pm) are the
-# two things that most often masquerade as a promo code in casual text.
 _AMOUNT_RE = re.compile(r"^(?:[N\u20a6#]?\d+)(?:\.\d+)?[KM]?$", re.IGNORECASE)
 _CLOCK_RE = re.compile(r"^\d{1,2}(?:AM|PM)$", re.IGNORECASE)
 
-
 def _is_paste_code_token(raw):
-    """True when a pasted token looks like something a human typed as a code. Voucher codes are always written in upper case. A pasted token qualifies when it is mixed (a digit AND a letter - CHOW5K, ENDEAVOR26, 5FOR5), when it was typed in ALL CAPS by the user (FIVEFORFIVE), or when it is a long alphabetic token that is clearly not ordinary chatter (a lower-case paste of a real code such as mrbeeistesting). Ordinary sentence words such as "grab" or "now" are rejected, so pasting "grab CHOW5K now" only claims CHOW5K instead of inventing GRABCHOW5KNOW. """
     if not raw or not any(c.isalpha() for c in raw):
         return False
     if _AMOUNT_RE.match(raw) or _CLOCK_RE.match(raw):
@@ -3007,18 +2628,10 @@ def _is_paste_code_token(raw):
         return True
     if raw == raw.upper():
         return len(raw) >= 5
-    # Lower-case, alphabetic only: accept only clearly code-sized tokens so a
-    # hand-pasted lower-case code is still caught while "grab"/"now"/"please"
-    # and similar chatter never claim.
     return len(raw) >= 10
 
-
 def extract_candidate_codes(text, min_len=5, require_caps=False, paste_mode=False):
-    """Extract promo-code candidates from free text. require_caps=True is used for X (Twitter) input only: Chowdeck posts its real codes in ALL CAPS (ENDEAVOR26, FIVEFORFIVE) while ordinary chatter is sentence-case ("Slight change of plans."), so a token must be typed in caps with at least one letter to qualify. paste_mode=True is used for Telegram pastes and OCR text: tokens are taken from the message individually (never the whole message as one code) and must be mixed or typed in ALL CAPS, so a lower-case code such as "chow5k" still works while random lower-case words never trigger a claim. One extra case is honoured for paste input: when the whole message is a single token, a *mixed-case* letters-only code (MrBee, Endeavor) is accepted even though it is short and has no digit, because people often retype a letters-only code in mixed case. Ordinary all-lowercase chatter ("hello") is still filtered, and a *sentence* such as "I am MRBEE of lagos" keeps the strict per-token rule so only the ALL-CAPS MRBEE is grabbed. """
     tokens = re.findall(r"[A-Za-z0-9]+", text or "")
-    # A lone, mixed-case alphabetic token is an explicit code paste: accept it so
-    # a letters-only code retyped as "MrBee" is never missed, while all-lowercase
-    # words and multi-word sentences keep the stricter per-token gate below.
     solo_mixed = (
         paste_mode
         and not require_caps
@@ -3045,9 +2658,7 @@ def extract_candidate_codes(text, min_len=5, require_caps=False, paste_mode=Fals
         out.append(cleaned)
     return list(dict.fromkeys(out))
 
-
 def strong_code_signal(text):
-    """Stricter test used while a security prompt is open. Uses the same paste gate as the normal path, then additionally requires the winning token to carry a digit or to have been typed in ALL CAPS. That way a freshly pasted code still hijacks the claim (code priority), while a plain alphabetic word - a typical security answer - is passed to the answer handler instead of being mistaken for a code. """
     for raw in re.findall(r"[A-Za-z0-9]+", text or ""):
         if not _is_paste_code_token(raw):
             continue
@@ -3060,7 +2671,6 @@ def strong_code_signal(text):
             return True
     return False
 
-
 def format_slot_range(slots):
     vals = sorted({int(s) for s in slots if str(s).isdigit()})
     if not vals:
@@ -3071,13 +2681,11 @@ def format_slot_range(slots):
         return f"Slots {vals[0]}-{vals[-1]}"
     return "Slots " + ", ".join(map(str, vals))
 
-
 def _to_int(value):
     try:
         return int(value)
     except (TypeError, ValueError):
         return None
-
 
 # ---------------------------------------------------------------------------
 # Claim orchestration
@@ -3093,18 +2701,14 @@ ACK_ANSWER_MIRROR = (
     "secondary slots for `{code}`..."
 )
 
-
 def _safe_resp_text(resp_data):
-    """JSON of a slot response, safe to embed inside a Markdown code span."""
     try:
         text = json.dumps(resp_data, ensure_ascii=False)
     except (TypeError, ValueError):
         text = str(resp_data)
     return text.replace("`", "'")
 
-
 async def _claim_and_report(chat_str, code, *, label="Personal Code Target", mirror=False, ack_text=None, specific_answer=None, notify_empty=False, rearm_hint=None):
-    """Fire `code` at every enabled slot and stream old-repo style messages. Each slot is reported on its own line so a slow, expired, inactive or congested slot can never hide another slot's result: * ``status == 0`` (inactive / expired / no token) is skipped silently and never blocks or hooks the rest of the claim. * a security question is surfaced immediately, grouped across every slot that asked for it, with a single paste-in-chat answer flow. * 500 / "high demand" congestion is collapsed into a single aggregated message after the burst retries complete, instead of one identical message per slot (which used to trip Telegram flood control). * The real response body is never masked: enable LOG_RAW_CLAIM to dump it. Returns ``{"ok": bool, "prompted": bool, "results": [...]}``. """
     chat_str = str(chat_str)
     chat_id = _to_int(chat_str)
     if chat_id is None:
@@ -3150,8 +2754,7 @@ async def _claim_and_report(chat_str, code, *, label="Personal Code Target", mir
     state = {"sent": False}
 
     async def flush_prompt():
-        """Send the grouped security question as soon as a slot reports one."""
-        await asyncio.sleep(0.12)  # group near-simultaneous prompts from the same burst
+        await asyncio.sleep(0.12)
         if state["sent"] or not prompt_slots:
             return
         state["sent"] = True
@@ -3169,8 +2772,6 @@ async def _claim_and_report(chat_str, code, *, label="Personal Code Target", mir
             "ts": time.time(),
             "msg_id": msg_id,
         })
-        # Feature 2: fire the AI lookup *after* the question is already on the
-        # user's screen, in the background, so it can never delay the claim.
         if _ai_enabled() and question:
             spawn_bg(assist_security_question(chat_id, chat_str, code, str(question)))
 
@@ -3183,7 +2784,7 @@ async def _claim_and_report(chat_str, code, *, label="Personal Code Target", mir
             continue
         status = res.get("status")
         if status == 0:
-            continue  # inactive / expired / no token: never hook the claim
+            continue
         slot = res.get("slot")
         collected.append({"slot": slot, "status": status,
                           "response": res.get("response", {})})
@@ -3201,14 +2802,9 @@ async def _claim_and_report(chat_str, code, *, label="Personal Code Target", mir
         msg_lower = str(resp_data.get("message", "")).lower() if isinstance(resp_data, dict) else ""
         cart_suffix = res.get("cart_str", "")
         if status in (401, 403):
-            # Token rejected as unauthenticated: report once, aggregated, and
-            # point the user at the phone-login path instead of per-slot noise.
             auth_failed_slots.append(str(slot))
             continue
         if status in (429, 500, 502, 503, 504) or "high demand" in msg_lower:
-            # Collapse every congested slot into a single report: N identical
-            # "server congested" messages only add Telegram flood-control
-            # pressure and bury the slots that returned a real verdict.
             congested_slots.append(str(slot))
             continue
         summary_msg = (
@@ -3238,13 +2834,11 @@ async def _claim_and_report(chat_str, code, *, label="Personal Code Target", mir
             f"`/settoken`.",
         )
 
-    # A slow slot may have been the one holding the question: never leave it unshown.
     if prompt_slots and not state["sent"]:
         await flush_prompt()
 
     ok = any(r["status"] in (200, 201) for r in collected)
     if rearm_hint and not ok and not prompt_slots:
-        # The answer was likely rejected: re-arm the question so a retry is one paste away.
         if any(
             r["status"] in (400, 401, 422)
             and any(w in str(r["response"].get("message", "")).lower()
@@ -3261,9 +2855,7 @@ async def _claim_and_report(chat_str, code, *, label="Personal Code Target", mir
 
     return {"ok": ok, "prompted": bool(prompt_slots), "results": collected}
 
-
 async def claim_code_global(raw_code, announce=True):
-    """Serve an X/bridge-detected code to the ADMIN only, instantly. Regular whitelisted users are NOT auto-served any more. They copy the code from the channel broadcast and claim it themselves (paste the code, or `/code <CODE>`), which runs through claim_code_for_chat on their own slots. Only the admin chat and the admin's linked secondary accounts are fired, all enabled slots in parallel with no per-user throttle so the claim lands before the crowd. Any attached security question is relayed immediately. """
     code = robust_clean_code(raw_code)
     if not code or len(code) < 4:
         return
@@ -3273,15 +2865,12 @@ async def claim_code_global(raw_code, announce=True):
         return
 
     tokens_db = load_json(TOKENS_FILE)
-
-    # Admin + linked accounts are the only auto-serve targets.
     targets = [c for c in get_admin_claim_targets() if tokens_db.get(c)]
 
     announce_text = (
         f"🚨 *New Chowdeck code detected!*\n\nCode: `{code}`\n"
         f"⚡ *Rush to your bot now — it will not wait.*"
     )
-    # Announce concurrently so the public channel post never delays the claims.
     announce_task = (
         asyncio.create_task(announce_channel(announce_text)) if announce else None
     )
@@ -3289,7 +2878,6 @@ async def claim_code_global(raw_code, announce=True):
     try:
         if targets:
             async def run_admin(c_str):
-                # No semaphore: admin slots all fire at once.
                 mirror = str(c_str) != ADMIN_CHAT_ID
                 try:
                     await _claim_and_report(
@@ -3307,7 +2895,6 @@ async def claim_code_global(raw_code, announce=True):
 
             await asyncio.gather(*(run_admin(c) for c in targets))
         elif ADMIN_CHAT_ID:
-            # Detected, but the admin has nothing to claim with - tell them.
             await send_telegram(
                 _to_int(ADMIN_CHAT_ID),
                 f"🚨 Code `{code}` detected on X, but you have no configured slots.\n"
@@ -3316,7 +2903,6 @@ async def claim_code_global(raw_code, announce=True):
     finally:
         if announce_task is not None:
             await announce_task
-
 
 async def claim_code_for_chat(chat_str, raw_code):
     chat_str = str(chat_str)
@@ -3351,9 +2937,7 @@ async def claim_code_for_chat(chat_str, raw_code):
             notify_empty=not mirror,
         )
 
-
 async def handle_answer(chat_str, answer_text, pending_entry):
-    """Fire the user's pasted answer at their slots immediately, no storage."""
     chat_str = str(chat_str)
     answer_text = str(answer_text).strip()
     code = (pending_entry or {}).get("code")
@@ -3383,9 +2967,7 @@ async def handle_answer(chat_str, answer_text, pending_entry):
             rearm_hint=(pending_entry or {}).get("question") or "Security question required.",
         )
 
-
 async def handle_ai_answer_callback(cq_id, chat_id, msg_id, chat_str, action):
-    """Feature 2: the user tapped an AI suggestion - submit it as the answer. `action` is `aians_<idx>_<code>`. A suggestion is only ever a shortcut for typing the same text, so it is funnelled through the exact same handle_answer() path the typed flow uses. The question must still be live (same code) or the tap is ignored, so a stale button can never fire a claim against a question the user is not looking at. """
     chat_str = str(chat_str)
     parts = action.split("_", 2)
     if len(parts) < 3:
@@ -3411,7 +2993,6 @@ async def handle_ai_answer_callback(cq_id, chat_id, msg_id, chat_str, action):
         await answer_callback_query(cq_id, "Empty suggestion.")
         return
 
-    # Consume the prompt exactly like a typed answer does, then fire it.
     entry = pop_pending(chat_str, code=code) or entry
     await answer_callback_query(cq_id, f"Submitting: {answer[:40]}")
     try:
@@ -3425,7 +3006,6 @@ async def handle_ai_answer_callback(cq_id, chat_id, msg_id, chat_str, action):
     except Exception:  # noqa: BLE001
         pass
     await handle_answer(chat_str, answer, entry)
-
 
 async def worker():
     while True:
@@ -3445,9 +3025,7 @@ async def worker():
         finally:
             _code_queue.task_done()
 
-
 async def process_text_global(text, require_caps=True):
-    """X (Twitter) intake path - caps-only, see extract_candidate_codes."""
     codes = extract_candidate_codes(text, min_len=5, require_caps=require_caps)
     for code in codes:
         try:
@@ -3455,7 +3033,6 @@ async def process_text_global(text, require_caps=True):
         except asyncio.QueueFull:
             print("[queue] full, dropping code", flush=True)
     return codes
-
 
 async def process_text_isolated(chat_str, text):
     codes = extract_candidate_codes(text, min_len=4, paste_mode=True)
@@ -3465,9 +3042,8 @@ async def process_text_isolated(chat_str, text):
         except asyncio.QueueFull:
             print("[queue] full, dropping code", flush=True)
 
-
 # ---------------------------------------------------------------------------
-# HTTP webhook server (bridge receiver)
+# HTTP webhook server
 # ---------------------------------------------------------------------------
 class WebhookHandler(BaseHTTPRequestHandler):
     server_version = "ChowdeckBridge/2.0"
@@ -3494,7 +3070,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/health"):
-            # Liveness only - no sensitive state, safe for platform healthchecks.
             self._send_json(200, {"status": "online"})
             return
         if path == "/status":
@@ -3536,7 +3111,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
-
 def run_http_server():
     if not WEBHOOK_SECRET and not ALLOW_INSECURE_WEBHOOK:
         print(
@@ -3557,7 +3131,6 @@ def run_http_server():
     except Exception as e:  # noqa: BLE001
         print(f"[http] server stopped: {e}", flush=True)
 
-
 # ---------------------------------------------------------------------------
 # Telegram menu / command handling
 # ---------------------------------------------------------------------------
@@ -3576,7 +3149,6 @@ def menu_text(chat_str):
         f"AI assist: `{'ON' if _ai_enabled() else 'OFF'}`\n\n"
         "Pick an option below."
     )
-
 
 GUIDE_TEXT = (
     "📖 *How this bot works*\n\n"
@@ -3634,7 +3206,6 @@ LOGIN_HELP_TEXT = (
     "• `/accounts` — check which linked accounts are still active"
 )
 
-
 async def refresh_all_phones(chat_str):
     chat_str = str(chat_str)
     tokens_db = load_json(TOKENS_FILE)
@@ -3652,15 +3223,12 @@ async def refresh_all_phones(chat_str):
         save_json(TOKENS_FILE, tokens_db)
     return updated
 
-
 async def handle_command(chat_id, chat_str, text, is_admin):
     parts = text.split(" ", 1)
     cmd = parts[0].split("@", 1)[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
     if cmd in ("/start", "/help"):
-        # Menu only. The guide is on-demand: it is sent solely when the user
-        # taps the "📖 Guide / Help" button (btn_guide) or types /guide.
         await send_telegram(chat_id, menu_text(chat_str),
                             reply_markup=build_control_keyboard(chat_str, is_admin))
     elif cmd == "/guide":
@@ -3819,8 +3387,6 @@ async def handle_command(chat_id, chat_str, text, is_admin):
         await send_telegram(chat_id, "🔎 Searching the web…")
         provider, answers, elapsed = await ai_answer_candidates(arg)
         if not answers and AI_LATE_DEADLINE > AI_DEADLINE:
-            # Interactive lookup: the user is right here waiting, so give a
-            # search-grounded model its longer budget before reporting nothing.
             await send_telegram(
                 chat_id,
                 "⏳ Still searching — a web-grounded model can take up to "
@@ -3968,10 +3534,8 @@ async def handle_command(chat_id, chat_str, text, is_admin):
     else:
         await send_telegram(chat_id, "ℹ️ Unknown command. Send /help for the guide.")
 
-
 def chat_chat_id_guard(chat_id):
     return chat_id
-
 
 async def handle_callback(update, tg_client):
     cq = update["callback_query"]
@@ -4120,7 +3684,6 @@ async def handle_callback(update, tg_client):
     else:
         await answer_callback_query(cq_id, "Unknown action")
 
-
 async def show_accounts(chat_id, msg_id, chat_str, max_slots, refreshed=False):
     enabled = sum(1 for i in range(1, max_slots + 1) if is_slot_active_state(chat_str, str(i)))
     extra = "\nPhones refreshed." if refreshed else "\n✅ = enabled & claiming | ❌ = disabled"
@@ -4130,7 +3693,6 @@ async def show_accounts(chat_id, msg_id, chat_str, max_slots, refreshed=False):
         f"Enabled: `{enabled}`{extra}",
         build_accounts_keyboard(chat_str),
     )
-
 
 # ---------------------------------------------------------------------------
 # Telegram long polling
@@ -4166,8 +3728,6 @@ async def handle_text_update(update):
     pending = list_pending(chat_str)
     reply_to = (msg.get("reply_to_message") or {}).get("message_id")
 
-    # Feature 1: while an OTP login is open, a bare 4/6-digit message completes
-    # the sign-in. A reply to a security-question prompt is an answer, not an OTP.
     if await maybe_handle_login_otp(chat_id, chat_str, text, reply_to, pending):
         return
 
@@ -4177,9 +3737,6 @@ async def handle_text_update(update):
             await handle_answer(chat_str, text, entry)
             return
         if strong_code_signal(text):
-            # A fresh code arrived while a question is open: claim it. The
-            # "Processing personal code ..." acknowledgement comes from the
-            # claim path, and the pending question stays open for one paste.
             await process_text_isolated(chat_str, text)
             return
         entry = pop_pending(chat_str)
@@ -4195,7 +3752,6 @@ async def handle_text_update(update):
         "ℹ️ That does not look like a promo code. Send the code as text "
         "(e.g. `CHOW5K`), or paste a screenshot to OCR it.",
     )
-
 
 async def handle_photo_update(update, tg_client):
     msg = update["message"]
@@ -4225,7 +3781,6 @@ async def handle_photo_update(update, tg_client):
             await send_telegram(chat_id, "❌ No text found in that screenshot. Please send it as text.")
     except Exception as e:  # noqa: BLE001
         print(f"[photo] error: {e}", flush=True)
-
 
 async def telegram_poller():
     global last_update_id
@@ -4263,13 +3818,11 @@ async def telegram_poller():
                 await asyncio.sleep(2)
             await asyncio.sleep(0.02)
 
-
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 last_update_id = 0
 WORKER_COUNT = max(1, int(os.getenv("WORKER_COUNT", "3")))
-
 
 async def main():
     global loop_ref
@@ -4282,8 +3835,6 @@ async def main():
     if not ADMIN_CHAT_ID:
         print("[boot] WARNING: ADMIN_CHAT_ID is not set - no user will have admin rights.", flush=True)
 
-    # Resolve the Gemini model list now, in the background, so the first live
-    # security question is not delayed by model discovery.
     if _ai_enabled():
         spawn_bg(_ai_warm_models())
 
@@ -4293,7 +3844,6 @@ async def main():
     finally:
         for w in workers:
             w.cancel()
-        # Background helpers (token refresh, AI lookups) are ours to stop.
         for task in list(_bg_tasks) + list(_refresh_tasks.values()):
             task.cancel()
         flush_store()
@@ -4304,7 +3854,6 @@ async def main():
             await _AI_CLIENT_LATE.aclose()
         except Exception:
             pass
-
 
 if __name__ == "__main__":
     try:
